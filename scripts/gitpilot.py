@@ -19,6 +19,7 @@ Usage:
     python3 gitpilot.py            # interactive menu
     python3 gitpilot.py doctor     # health check only
     python3 gitpilot.py checkin    # guided check-in flow
+    python3 gitpilot.py branch     # create / switch / merge / delete branches
     python3 gitpilot.py tag        # guided tag flow
     python3 gitpilot.py release    # guided release flow
     python3 gitpilot.py backup     # snapshot working tree + repo bundle
@@ -79,11 +80,11 @@ def use_color() -> bool:
 def paint(txt, color):
     return f"{color}{txt}{C.END}" if use_color() else txt
 
-def ok(msg):    print(paint("  ✔ ", C.OK) + msg)
-def warn(msg):  print(paint("  ⚠ ", C.WARN) + msg)
-def err(msg):   print(paint("  ✘ ", C.ERR) + msg)
-def info(msg):  print(paint("  ▸ ", C.CYAN) + msg)
-def head(msg):  print("\n" + paint(f"── {msg} ", C.BOLD) + paint("─" * max(0, 60 - len(msg)), C.DIM))
+def ok(msg):    print(paint("  \u2714 ", C.OK) + msg)
+def warn(msg):  print(paint("  \u26a0 ", C.WARN) + msg)
+def err(msg):   print(paint("  \u2718 ", C.ERR) + msg)
+def info(msg):  print(paint("  \u25b8 ", C.CYAN) + msg)
+def head(msg):  print("\n" + paint(f"\u2500\u2500 {msg} ", C.BOLD) + paint("\u2500" * max(0, 60 - len(msg)), C.DIM))
 
 def ask(prompt, default=None):
     suffix = f" [{default}]" if default is not None else ""
@@ -178,6 +179,54 @@ def repo_in_progress_state():
 def timestamp():
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
+def all_branches():
+    """Local branch names, current first if possible."""
+    out = git_out("branch", "--format=%(refname:short)")
+    return out.splitlines() if out else []
+
+def branch_exists(name):
+    return bool(git_out("rev-parse", "--verify", "-q", f"refs/heads/{name}", default=""))
+
+def remote_branch_exists(name, remote=None):
+    remote = remote or default_remote()
+    if not remote:
+        return False
+    return bool(git_out("ls-remote", "--heads", remote, name, default=""))
+
+def is_protected(name):
+    return name in PROTECTED_BRANCHES
+
+def valid_branch_name(name):
+    """Validate a branch name. Prefer git's own checker, fall back to regex.
+
+    Returns (ok: bool, reason: str).
+    """
+    if not name or name != name.strip():
+        return False, "name is empty or has surrounding whitespace"
+    # Let git be the source of truth when available.
+    res = run(["git", "check-ref-format", "--branch", name], check=False)
+    if res.returncode == 0:
+        return True, ""
+    # Fallback heuristics (git not cooperating / very old git).
+    if not re.match(r"^[A-Za-z0-9._/-]+$", name):
+        return False, "only letters, digits, '.', '_', '/', '-' are allowed"
+    if name.startswith("-") or name.startswith("/") or name.endswith("/"):
+        return False, "cannot start with '-' or '/', or end with '/'"
+    if ".." in name or name.endswith(".lock") or "//" in name:
+        return False, "cannot contain '..', '//', or end with '.lock'"
+    return True, ""
+
+def ahead_behind(branch, base):
+    """Return (ahead, behind) of branch relative to base, or (None, None)."""
+    counts = git_out("rev-list", "--left-right", "--count", f"{base}...{branch}")
+    if not counts:
+        return None, None
+    try:
+        behind, ahead = (int(x) for x in counts.split())
+        return ahead, behind
+    except ValueError:
+        return None, None
+
 # --------------------------------- doctor -----------------------------------
 
 def doctor(verbose=True):
@@ -236,7 +285,7 @@ def doctor(verbose=True):
 
     if has_remote():
         r = default_remote()
-        ok(f"Remote configured: {r} → {git_out('remote', 'get-url', r)}")
+        ok(f"Remote configured: {r} \u2192 {git_out('remote', 'get-url', r)}")
     else:
         warn("No remote configured. You can commit and tag locally, but not "
              "push or create releases.")
@@ -259,7 +308,7 @@ def doctor(verbose=True):
 
     print()
     print(paint("  Overall: ", C.BOLD) +
-          (paint("READY", C.OK) if healthy else paint("ISSUES FOUND — fix the ✘ items above", C.ERR)))
+          (paint("READY", C.OK) if healthy else paint("ISSUES FOUND — fix the \u2718 items above", C.ERR)))
     return healthy
 
 # ------------------------------ safety scans --------------------------------
@@ -346,8 +395,8 @@ def bundle_repo(label="manual"):
 def flow_backup():
     head("Backup")
     print("  Two layers of protection:")
-    print("   • worktree snapshot — your files exactly as they are now (incl. uncommitted)")
-    print("   • repo bundle       — entire git history, branches and tags in one file")
+    print("   \u2022 worktree snapshot — your files exactly as they are now (incl. uncommitted)")
+    print("   \u2022 repo bundle       — entire git history, branches and tags in one file")
     snapshot_worktree()
     bundle_repo()
     prune_old_backups()
@@ -465,7 +514,7 @@ def flow_checkin():
     # --- protection gates ---
     findings = scan_secrets(changed_paths)
     if findings:
-        head("⚠ Possible secrets detected")
+        head("\u26a0 Possible secrets detected")
         for rel, ln, label in findings[:20]:
             err(f"{rel}:{ln} — {label}")
         warn("Committing secrets to git is near-impossible to fully undo once pushed.")
@@ -602,9 +651,9 @@ def flow_tag():
         maj, mnr, pat = ver
         prefix = "v" if last_tag.startswith("v") else ""
         options = [
-            (f"{prefix}{maj}.{mnr}.{pat+1}", f"PATCH  → {prefix}{maj}.{mnr}.{pat+1}   (bug fixes only)"),
-            (f"{prefix}{maj}.{mnr+1}.0",     f"MINOR  → {prefix}{maj}.{mnr+1}.0   (new features, backwards-compatible)"),
-            (f"{prefix}{maj+1}.0.0",         f"MAJOR  → {prefix}{maj+1}.0.0   (breaking changes)"),
+            (f"{prefix}{maj}.{mnr}.{pat+1}", f"PATCH  \u2192 {prefix}{maj}.{mnr}.{pat+1}   (bug fixes only)"),
+            (f"{prefix}{maj}.{mnr+1}.0",     f"MINOR  \u2192 {prefix}{maj}.{mnr+1}.0   (new features, backwards-compatible)"),
+            (f"{prefix}{maj+1}.0.0",         f"MAJOR  \u2192 {prefix}{maj+1}.0.0   (breaking changes)"),
             ("__custom__", "Custom tag name")]
         new_tag = choose("What kind of release is this?", options)
         if new_tag == "__custom__":
@@ -673,6 +722,376 @@ def _manual_release_notes(tag):
     print("    2. On GitHub/GitLab: Releases → Draft new release → choose the tag")
     print("    3. Paste the changelog shown above as release notes")
 
+# ------------------------------ branch flow ---------------------------------
+
+BRANCH_PREFIXES = [
+    ("feature/", "feature/  — new functionality"),
+    ("fix/",     "fix/      — bug fix"),
+    ("hotfix/",  "hotfix/   — urgent production fix"),
+    ("chore/",   "chore/    — tooling / maintenance"),
+    ("release/", "release/  — release stabilization"),
+    ("__none__", "(no prefix — type the full name myself)"),
+]
+
+def _pick_base_ref():
+    """Let the user choose the base to branch/merge from. Returns ref or None."""
+    remote = default_remote()
+    locals_ = all_branches()
+    opts = []
+    # Prefer an up-to-date main/master base at the top.
+    for b in ("main", "master", "develop"):
+        if b in locals_:
+            opts.append((b, f"{b}  (local)"))
+    for b in locals_:
+        if b not in ("main", "master", "develop"):
+            opts.append((b, f"{b}  (local)"))
+    if remote:
+        opts.append((f"{remote}/HEAD", f"{remote}/HEAD  (remote default branch)"))
+    opts.append(("__other__", "Other ref (tag / commit / remote branch)"))
+    base = choose("Base this off which ref?", opts)
+    if base == "__other__":
+        base = ask("Ref (e.g. origin/main, a tag, or a commit)")
+    return base or None
+
+def branch_new():
+    head("Create a new branch")
+    # 1) choose base
+    base = _pick_base_ref()
+    if not base:
+        return
+    if not git_out("rev-parse", "--verify", "-q", f"{base}^{{commit}}"):
+        err(f"'{base}' is not a valid ref."); return
+
+    # 2) offer to refresh the base from the remote first (best practice)
+    remote = default_remote()
+    if remote and "/" not in base and confirm(
+            f"Fetch latest '{base}' from {remote} first (recommended)?",
+            default_no=False):
+        git("fetch", remote, base, check=False, mutating=True)
+        # if base has an upstream and is behind, note it (don't auto-move it)
+        up = upstream_of(base)
+        if up:
+            a, b = ahead_behind(base, up)
+            if b:
+                warn(f"Local '{base}' is {b} commit(s) behind {up}. "
+                     f"Branching from {up} instead to start fresh.")
+                base = up
+
+    # 3) name it (prefix helper -> conventional branch names)
+    prefix = choose("Branch type?", BRANCH_PREFIXES)
+    if prefix is None:
+        return
+    if prefix == "__none__":
+        name = ask("Full branch name")
+    else:
+        slug = ask(f"Short description after '{prefix}' (e.g. login-timeout)")
+        slug = re.sub(r"\s+", "-", slug.strip().lower())
+        slug = re.sub(r"[^a-z0-9._/-]", "", slug)
+        name = f"{prefix}{slug}" if slug else ""
+    if not name:
+        warn("No branch name given; cancelled."); return
+    valid, reason = valid_branch_name(name)
+    if not valid:
+        err(f"Invalid branch name ({reason})."); return
+    if branch_exists(name):
+        err(f"Branch '{name}' already exists."); return
+
+    # 4) carry uncommitted work? git switch -c brings changes along by default.
+    if dirty_files():
+        info("You have uncommitted changes; they will move to the new branch "
+             "with you (git's default).")
+
+    git("switch", "-c", name, base, mutating=True)
+    ok(f"Created and switched to '{name}' (based on {base}).")
+
+    if remote and confirm(f"Publish '{name}' to {remote} and set upstream?",
+                          default_no=False):
+        r = git("push", "-u", remote, name, check=False, mutating=True)
+        ok("Published with upstream set.") if r.returncode == 0 else \
+            err("Push failed:\n" + (r.stderr or "").strip())
+    else:
+        info(f"When ready to publish: git push -u {remote or 'origin'} {name}")
+
+def branch_switch():
+    head("Switch branch")
+    branches = all_branches()
+    cur = current_branch()
+    if not branches:
+        info("No local branches."); return
+    opts = [(b, f"{b}{'  (current)' if b == cur else ''}") for b in branches
+            if b != cur]
+    opts.append(("__new__", "+ create a new branch instead"))
+    target = choose("Switch to…", opts)
+    if target is None:
+        return
+    if target == "__new__":
+        return branch_new()
+    if dirty_files():
+        warn("You have uncommitted changes.")
+        act = choose("Before switching…", [
+            ("carry", "Carry them with me (git switch — fails on conflict)"),
+            ("stash", "Stash them here, switch clean, I'll pop later"),
+            ("cancel", "Cancel")])
+        if act == "cancel" or act is None:
+            return
+        if act == "stash":
+            git("stash", "push", "--include-untracked", "-m",
+                f"gitpilot pre-switch {timestamp()}", mutating=True)
+            ok("Stashed. After switching: git stash pop")
+    r = git("switch", target, check=False, mutating=True)
+    if r.returncode == 0:
+        ok(f"On branch '{target}'.")
+    else:
+        err("Switch failed:\n" + (r.stderr or "").strip())
+        info("Tip: commit or stash your changes, then try again.")
+
+def _do_merge(source, target):
+    """Merge `source` INTO `target`. Assumes we are standing on `target` and
+    the working tree is clean. Handles style choice, snapshot, conflicts, push.
+    """
+    # Show what would come in.
+    a, b = ahead_behind(source, target)
+    if a == 0:
+        ok(f"'{source}' has nothing '{target}' doesn't already have — "
+           "already merged.")
+        return
+    if a is not None:
+        info(f"'{source}' has {a} commit(s) not yet in '{target}':")
+        log = git_out("log", f"{target}..{source}", "--format=- %s", default="")
+        print("\n".join("     " + l for l in log.splitlines()[:20]) or "     (none)")
+
+    strategy = choose("Merge style?", [
+        ("noff", "Merge commit ALWAYS (--no-ff) — keeps a clear merge point "
+                 "(recommended for feature branches)"),
+        ("ff",   "Fast-forward if possible (--ff) — linear history when it can"),
+        ("squash", "Squash — combine all of the branch's commits into ONE, "
+                   "which you then commit"),
+    ])
+    if strategy is None:
+        return
+
+    # Safety net before touching the branch.
+    snapshot_worktree(label=f"pre-merge-{re.sub(r'[^A-Za-z0-9._-]','_',source)}")
+
+    if strategy == "squash":
+        r = git("merge", "--squash", source, check=False, mutating=True)
+        if r.returncode != 0:
+            err("Squash merge hit conflicts. Resolve files, `git add` them, "
+                "then commit. To bail out: git merge --abort")
+            return
+        ok("Squash staged. All of the branch's changes are staged as one.")
+        msg = ask("Commit message for the squashed merge",
+                  f"merge {source} into {target} (squash)")
+        if msg.strip():
+            git("commit", "-m", msg, mutating=True)
+            ok("Squashed merge committed.")
+        else:
+            info("Nothing committed yet; run the check-in flow when ready.")
+    else:
+        flag = "--no-ff" if strategy == "noff" else "--ff"
+        r = git("merge", flag, "--no-edit", source, check=False, mutating=True)
+        if r.returncode != 0:
+            err("Merge produced conflicts.")
+            unmerged = git_out("diff", "--name-only", "--diff-filter=U")
+            if unmerged:
+                for f in unmerged.splitlines():
+                    warn(f"  conflict: {f}")
+            info("Resolve each file, `git add` it, then `git commit` to finish.")
+            info("Or keep one whole side:  git checkout --theirs <file>  "
+                 "(the branch coming in)  /  --ours <file>  (this branch).")
+            info("Changed your mind? `git merge --abort` restores the pre-merge state.")
+            return
+        ok(f"Merged '{source}' into '{target}'.")
+
+    if has_remote() and confirm(f"Push '{target}' to {default_remote()}?",
+                                default_no=False):
+        r = git("push", default_remote(), target, check=False, mutating=True)
+        ok("Pushed.") if r.returncode == 0 else err(
+            "Push failed:\n" + (r.stderr or "").strip())
+
+def _ensure_clean_tree(context="merge"):
+    """Return True if safe to proceed (clean tree, or stashed on request)."""
+    if not dirty_files():
+        return True
+    warn("Working tree has uncommitted changes. Commit or stash them first so "
+         f"a conflicting {context} can be aborted cleanly.")
+    if confirm("Stash them now and continue?", default_no=False):
+        git("stash", "push", "--include-untracked", "-m",
+            f"gitpilot pre-{context} {timestamp()}", mutating=True)
+        ok("Stashed. Recover later with: git stash pop")
+        return True
+    info("Cancelled.")
+    return False
+
+def branch_merge():
+    head("Merge a branch")
+    branches = all_branches()
+    cur = current_branch()
+    if cur == "HEAD":
+        err("Detached HEAD — switch to a branch before merging."); return
+    if len(branches) < 2:
+        info("Need at least two branches to merge."); return
+
+    # Direction chooser — so you don't have to already be standing on the
+    # destination. This is the common "get my feature onto main" case.
+    direction = choose("Which way should the merge go?", [
+        ("into_cur", f"Bring another branch INTO '{cur}'  (stay on '{cur}')"),
+        ("cur_into", f"Send '{cur}' INTO another branch  (I'll switch there first)"),
+    ])
+    if direction is None:
+        return
+
+    if direction == "cur_into":
+        # Merge the current branch into a chosen target (typically main).
+        source = cur
+        opts = [(b, b + ("   [protected]" if is_protected(b) else "")) for b in branches if b != cur]
+        opts.append(("__other__", "Other target (local branch)"))
+        target = choose(f"Send '{cur}' INTO which branch?", opts)
+        if target is None:
+            return
+        if target == "__other__":
+            target = ask("Target branch name")
+            if not target or not branch_exists(target):
+                err("Not a valid local branch."); return
+        if is_protected(target):
+            info(f"'{target}' is a protected/mainline branch — merging your "
+                 "work in is the normal way to share it. Proceeding.")
+        if not _ensure_clean_tree("merge"):
+            return
+        # Move to the target, refresh it, then merge the source in.
+        r = git("switch", target, check=False, mutating=True)
+        if r.returncode != 0:
+            err("Could not switch to target:\n" + (r.stderr or "").strip()); return
+        ok(f"Now on '{target}'.")
+        if has_remote() and upstream_of(target) and confirm(
+                f"Pull latest '{target}' from {default_remote()} first "
+                "(recommended)?", default_no=False):
+            git("pull", "--ff-only", default_remote(), target,
+                check=False, mutating=True)
+        _do_merge(source, target)
+        # Offer to hop back to where the user was.
+        if confirm(f"Switch back to '{source}'?", default_no=False):
+            git("switch", source, check=False, mutating=True)
+    else:
+        # Bring a chosen branch into the current one.
+        opts = [(b, b + ("   [protected]" if is_protected(b) else "")) for b in branches if b != cur]
+        opts.append(("__other__", "Other ref (remote branch / tag / commit)"))
+        source = choose(f"Bring which branch INTO '{cur}'?", opts)
+        if source is None:
+            return
+        if source == "__other__":
+            source = ask("Ref to merge in (e.g. origin/feature/x)")
+        if not source:
+            return
+        if not git_out("rev-parse", "--verify", "-q", f"{source}^{{commit}}"):
+            err(f"'{source}' is not a valid ref."); return
+        # Reversed-direction nudge: standing on a feature branch and pulling in
+        # a mainline branch is often the opposite of what people intend.
+        if is_protected(source) and not is_protected(cur):
+            warn(f"You are about to merge mainline '{source}' INTO your branch "
+                 f"'{cur}' (this updates '{cur}', NOT '{source}').")
+            info(f"If your goal is to publish '{cur}' onto '{source}', cancel and "
+                 "choose the other direction.")
+            if not confirm("Continue merging into the current branch?"):
+                info("Cancelled."); return
+        if not _ensure_clean_tree("merge"):
+            return
+        _do_merge(source, cur)
+
+def branch_delete():
+    head("Delete a branch")
+    branches = all_branches()
+    cur = current_branch()
+    candidates = [b for b in branches if b != cur]
+    if not candidates:
+        info("No other local branches to delete (can't delete the current one)."); return
+    target = choose("Delete which branch?",
+                    [(b, b + ("   [protected]" if is_protected(b) else ""))
+                     for b in candidates])
+    if target is None:
+        return
+
+    # Hard guard: mainline branches require typing the exact name to confirm.
+    if is_protected(target):
+        warn(f"'{target}' is a PROTECTED mainline branch. Deleting it is almost "
+             "never what you want and can break everyone cloning the repo.")
+        typed = ask(f"To confirm you really mean it, type the name exactly "
+                    f"('{target}') — anything else cancels")
+        if typed != target:
+            info("Cancelled — protected branch kept safe."); return
+
+    # Is it fully merged into the current branch? Unmerged => real data-loss risk.
+    merged = git_out("branch", "--merged", default="")
+    is_merged = any(line.strip().lstrip("* ").strip() == target
+                    for line in merged.splitlines())
+    if not is_merged:
+        warn(f"'{target}' has commits NOT merged into '{cur}'. Deleting it may "
+             "orphan that work (recoverable via reflog for ~90 days).")
+        if not confirm("Delete anyway?"):
+            info("Cancelled."); return
+
+    pushed = remote_branch_exists(target)
+    # Always leave an escape hatch: record the tip before deleting.
+    tip = git_out("rev-parse", "--short", target)
+    flag = "-d" if is_merged else "-D"
+    r = git("branch", flag, target, check=False, mutating=True)
+    if r.returncode != 0:
+        err("Delete failed:\n" + (r.stderr or "").strip()); return
+    ok(f"Deleted local branch '{target}' (was at {tip}).")
+    info(f"Recover within ~90 days: git branch {target} {tip}")
+
+    if pushed:
+        warn(f"'{target}' also exists on {default_remote()}.")
+        if is_protected(target):
+            warn("This is a PROTECTED branch on the remote — deleting it there "
+                 "affects everyone.")
+            typed = ask(f"Type '{target}' to delete it on the remote too, "
+                        "anything else keeps it")
+            if typed != target:
+                info("Remote branch kept."); return
+        elif not confirm(f"Delete it on {default_remote()} too?"):
+            return
+        r = git("push", default_remote(), "--delete", target,
+                check=False, mutating=True)
+        ok("Remote branch deleted.") if r.returncode == 0 else err(
+            "Remote delete failed:\n" + (r.stderr or "").strip())
+
+def branch_overview():
+    head("Branch overview")
+    cur = current_branch()
+    remote = default_remote()
+    if remote:
+        git("fetch", remote, check=False, mutating=True)
+    for b in all_branches():
+        marker = paint("*", C.OK) if b == cur else " "
+        up = upstream_of(b)
+        if up:
+            a, be = ahead_behind(b, up)
+            rel = f"\u2191{a} \u2193{be} vs {up}" if a is not None else f"tracks {up}"
+        else:
+            rel = paint("no upstream", C.DIM)
+        tag = paint(" [protected]", C.WARN) if is_protected(b) else ""
+        last = git_out("log", "-1", "--format=%cs %s", b, default="")
+        print(f"   {marker} {paint(b, C.BOLD)}{tag}  {rel}")
+        print(f"       {paint(last, C.DIM)}")
+
+def flow_branch():
+    while True:
+        head("\U0001f333 Branches")
+        act = choose("What do you want to do?", [
+            ("overview", "Overview (ahead/behind vs upstream, last commit)"),
+            ("new",      "Create a new branch (feature/fix/…)"),
+            ("switch",   "Switch to another branch"),
+            ("merge",    "Merge branches (either direction, safe, snapshot first)"),
+            ("delete",   "Delete a branch (merge-checked, protected-guarded)"),
+            ("rename",   "Rename a branch"),
+            ("back",     "Back to main menu")])
+        if act in (None, "back"):
+            return
+        {"overview": branch_overview, "new": branch_new, "switch": branch_switch,
+         "merge": branch_merge, "delete": branch_delete,
+         "rename": fix_rename_branch}[act]()
+
 # --------------------------------- history ----------------------------------
 
 # ------------------------------ fix & undo ----------------------------------
@@ -700,18 +1119,18 @@ def fix_rename_branch():
     new = ask("New name (e.g. feature/login-fix)")
     if not new:
         return
-    if not re.match(r"^[A-Za-z0-9._/-]+$", new) or new.endswith("/") \
-       or ".." in new or new.startswith("-"):
-        err("That's not a valid branch name."); return
+    valid, reason = valid_branch_name(new)
+    if not valid:
+        err(f"That's not a valid branch name ({reason})."); return
     if new in branches:
         err(f"'{new}' already exists."); return
-    if not confirm(f"Rename '{old}' → '{new}'?", default_no=False):
+    if not confirm(f"Rename '{old}' \u2192 '{new}'?", default_no=False):
         return
 
     pushed = has_remote() and bool(
         git_out("ls-remote", "--heads", default_remote(), old, default=""))
     git("branch", "-m", old, new, mutating=True)
-    ok(f"Local branch renamed: {old} → {new}")
+    ok(f"Local branch renamed: {old} \u2192 {new}")
 
     if pushed:
         warn(f"'{old}' also exists on {default_remote()}.")
@@ -753,7 +1172,7 @@ def fix_rename_tag():
             return
     git("tag", "-a", new, target, "-m", msg, mutating=True)
     git("tag", "-d", old, mutating=True)
-    ok(f"Local: '{old}' → '{new}' (same commit {target[:7]}, message preserved)")
+    ok(f"Local: '{old}' \u2192 '{new}' (same commit {target[:7]}, message preserved)")
     if pushed and has_remote():
         r = default_remote()
         git("push", r, new, mutating=True)
@@ -929,7 +1348,7 @@ def fix_stash_manager():
 
 def flow_fix():
     while True:
-        head("🔧 Fix & Undo")
+        head("\U0001f527 Fix & Undo")
         act = choose("What went wrong?", [
             ("branch",  "I picked a wrong BRANCH name → rename it"),
             ("tag",     "I picked a wrong TAG name → rename/move it"),
@@ -964,38 +1383,91 @@ def menu():
     while True:
         head("gitpilot — guided git pipeline")
         act = choose("What do you want to do?", [
-            ("doctor",  "🩺 Health check (preflight doctor)"),
-            ("checkin", "✅ Check in code  (scan → stage → commit → sync → push)"),
-            ("tag",     "🏷️  Tag a version (semver-guided, annotated)"),
-            ("release", "🚀 Create a release (tag + GitHub release)"),
-            ("backup",  "🧰 Backup now (worktree snapshot + full repo bundle)"),
-            ("restore", "⏪ Restore a clean tag/version (with safety net)"),
-            ("fix",     "🔧 Fix & Undo (rename branch/tag, amend, recover…)"),
-            ("history", "📜 Show history / tags / stashes"),
+            ("doctor",  "\U0001fa7a Health check (preflight doctor)"),
+            ("checkin", "\u2705 Check in code  (scan \u2192 stage \u2192 commit \u2192 sync \u2192 push)"),
+            ("branch",  "\U0001f333 Branches (create / switch / merge / delete)"),
+            ("tag",     "\U0001f3f7\ufe0f  Tag a version (semver-guided, annotated)"),
+            ("release", "\U0001f680 Create a release (tag + GitHub release)"),
+            ("backup",  "\U0001f9f0 Backup now (worktree snapshot + full repo bundle)"),
+            ("restore", "\u23ea Restore a clean tag/version (with safety net)"),
+            ("fix",     "\U0001f527 Fix & Undo (rename branch/tag, amend, recover…)"),
+            ("history", "\U0001f4dc Show history / tags / stashes"),
             ("quit",    "Exit")])
         if act in (None, "quit"):
-            print("  bye 👋"); return
+            print("  bye \U0001f44b"); return
         FLOWS[act]()
 
-FLOWS = {"doctor": doctor, "checkin": flow_checkin, "tag": flow_tag,
-         "release": flow_release, "backup": flow_backup,
+FLOWS = {"doctor": doctor, "checkin": flow_checkin, "branch": flow_branch,
+         "tag": flow_tag, "release": flow_release, "backup": flow_backup,
          "restore": flow_restore, "fix": flow_fix, "history": flow_history}
 
-def main():
+# Short aliases so muscle-memory works from the CLI.
+ALIASES = {"ci": "checkin", "commit": "checkin", "br": "branch",
+           "merge": "branch", "check": "doctor", "log": "history",
+           "undo": "fix", "snapshot": "backup"}
+
+VERSION = "1.2.0"
+
+USAGE = """gitpilot v{ver} — guided, guard-railed git pipeline
+
+Usage:
+  gitpilot                 open the interactive menu
+  gitpilot <command>       run one flow directly
+  gitpilot --dry-run <cmd> print mutating git commands instead of running them
+  gitpilot -h | --help     show this help
+  gitpilot --version       show version
+
+Commands:
+  doctor     preflight health check
+  checkin    scan -> stage -> commit -> sync -> push   (aliases: ci, commit)
+  branch     create / switch / merge / delete branches (aliases: br, merge)
+  tag        semver-guided annotated tag
+  release    tag + GitHub release (needs gh)
+  backup     worktree snapshot + full repo bundle       (alias: snapshot)
+  restore    restore a clean tag/version with a safety net
+  fix        rename branch/tag, amend, recover, stashes  (alias: undo)
+  history    show recent history / tags / stashes        (alias: log)
+""".format(ver=VERSION)
+
+def _enable_windows_ansi():
+    """Turn on ANSI escape processing on Windows 10+ consoles (no-op elsewhere)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.SetConsoleMode(k.GetStdHandle(-11), 7)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+def _run_main():
     global DRY_RUN
-    args = [a for a in sys.argv[1:]]
+    _enable_windows_ansi()
+    args = list(sys.argv[1:])
+
     if "--dry-run" in args:
         DRY_RUN = True
         args.remove("--dry-run")
         warn("DRY-RUN mode: mutating git commands will be printed, not executed.")
+
+    # Help / version work even outside a repo.
+    if any(a in ("-h", "--help", "help") for a in args):
+        print(USAGE); return
+    if any(a in ("--version", "-V") for a in args):
+        print(f"gitpilot {VERSION}"); return
+
     if not shutil.which("git"):
         err("git not found on PATH."); sys.exit(1)
+
     if args and args[0] != "menu":
-        cmd = args[0]
+        cmd = ALIASES.get(args[0], args[0])
         if cmd not in FLOWS:
-            err(f"Unknown command '{cmd}'. Options: {', '.join(FLOWS)}"); sys.exit(2)
+            err(f"Unknown command '{args[0]}'.")
+            info("Run `gitpilot --help` to see available commands.")
+            sys.exit(2)
         if cmd != "doctor" and not in_repo():
-            err("Not a git repository."); sys.exit(1)
+            err("Not a git repository. cd into a project (or git init) first.")
+            sys.exit(1)
         FLOWS[cmd]()
     else:
         if not in_repo():
@@ -1003,5 +1475,14 @@ def main():
             sys.exit(1)
         menu()
 
+def main():
+    try:
+        _run_main()
+    except KeyboardInterrupt:
+        print()
+        info("Interrupted. No further changes made.")
+        sys.exit(130)
+
 if __name__ == "__main__":
     main()
+
