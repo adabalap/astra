@@ -311,24 +311,114 @@ def gh_authed():
         return False
     return run(["gh", "auth", "status"], check=False).returncode == 0
 
+def remote_reachable(target):
+    """Can we READ from this remote (repo exists AND we have access)?
+    `target` is a remote name (e.g. 'origin') or a URL. Uses your normal git
+    auth (SSH key / HTTPS token) — nothing to do with `gh`.
+    Returns (ok: bool, stderr: str)."""
+    if DRY_RUN:
+        return True, ""
+    r = run(["git", "ls-remote", target], check=False)
+    return (r.returncode == 0), (r.stderr or "")
+
 def gh_try_login():
-    """Offer to run `gh auth login` interactively. Returns True if now authed."""
+    """Optionally run `gh auth login`. Returns True if authed afterwards.
+
+    Important: this is ONLY needed to auto-CREATE a repo. Pushing/pulling use
+    your normal git auth (SSH key or HTTPS token), which is separate from gh.
+    """
     if not gh_available():
         return False
     if gh_authed():
         return True
-    if not confirm("Log in to GitHub now with `gh auth login`?", default_no=False):
+    info("Note: `gh` login is separate from your git SSH/HTTPS auth and is only "
+         "needed so gh can CREATE the repo for you. If you already have SSH set "
+         "up, you can skip this and just paste a repo URL instead.")
+    if not confirm("Log in to GitHub with `gh auth login` now (optional)?",
+                   default_no=True):
         return False
     if DRY_RUN:
         info("[dry-run] gh auth login")
         return False
-    # Interactive: let gh own the terminal (do NOT capture) so prompts show.
-    subprocess.run(["gh", "auth", "login"])
+    info("Handing control to `gh` — follow its prompts (Ctrl+C to cancel and "
+         "come back to the URL method).")
+    try:
+        # Interactive: let gh own the terminal (do NOT capture) so prompts show.
+        subprocess.run(["gh", "auth", "login"])
+    except KeyboardInterrupt:
+        print()
+        info("gh login cancelled — no problem, we'll use the URL method.")
+        return False
     if gh_authed():
         ok("GitHub CLI authenticated.")
         return True
-    warn("Still not authenticated.")
+    warn("Still not authenticated with gh — we'll use the URL method instead.")
     return False
+
+def _diagnose_gh_error(stderr):
+    """Explain common `gh` API errors, especially token-scope problems."""
+    s = (stderr or "").lower()
+    if ("not accessible by personal access token" in s
+            or "http 403" in s or "resource not accessible" in s
+            or "insufficient" in s or "scope" in s):
+        warn("Your gh token is missing the required permissions.")
+        info("A CLASSIC token needs scopes: 'repo', 'read:org', "
+             "'admin:public_key'. A FINE-GRAINED token needs "
+             "'Administration: read & write' on your repositories.")
+        info("Re-login with:  gh auth login --scopes 'repo,read:org,"
+             "admin:public_key'   (or create the repo in the browser instead).")
+        return "scope"
+    if "already exists" in s:
+        info("That repository name already exists on GitHub — reuse it by "
+             "pasting its URL below.")
+        return "exists"
+    return "unknown"
+
+def normalize_remote_url(url):
+    """Validate and gently fix common remote-URL mistakes.
+
+    Returns (fixed_url, note). `note` is a human explanation when something was
+    changed, or "" if the URL was already fine. Returns (None, reason) if the
+    URL is unusable and can't be auto-fixed.
+
+    The classic trap this catches: 'git@github.com/owner/repo.git' (a SLASH
+    after the host) which git reads as a bogus local path. The valid SCP-like
+    form needs a COLON: 'git@github.com:owner/repo.git'.
+    """
+    if not url:
+        return None, "empty URL"
+    u = url.strip()
+
+    # Strip an accidental wrapping in quotes/backticks.
+    u = u.strip("'\"`")
+
+    # scp-like SSH: user@host:path  (the correct form)
+    m = re.match(r"^([^@/\s]+)@([^:/\s]+):(.+)$", u)
+    if m:
+        return u, ("" if u == url.strip() else "trimmed surrounding characters")
+
+    # user@host/owner/repo  -> user@host:owner/repo   (slash typo -> colon)
+    m = re.match(r"^([^@/\s]+)@([^:/\s]+)/(.+)$", u)
+    if m:
+        fixed = f"{m.group(1)}@{m.group(2)}:{m.group(3)}"
+        return fixed, (f"fixed SSH URL: '{m.group(2)}/' should be "
+                       f"'{m.group(2)}:' (host and path are separated by a "
+                       "colon, not a slash)")
+
+    # Proper URL schemes are fine as-is.
+    if re.match(r"^(https?|ssh|git)://", u):
+        return u, ("" if u == url.strip() else "trimmed surrounding characters")
+
+    # Bare 'owner/repo' — assume GitHub over SSH (matches user's existing setup).
+    if re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(\.git)?$", u):
+        fixed = f"git@github.com:{u}"
+        if not fixed.endswith(".git"):
+            fixed += ".git"
+        return fixed, f"interpreted '{u}' as GitHub SSH: {fixed}"
+
+    return None, ("unrecognized remote URL. Use one of:\n"
+                  "        git@github.com:owner/repo.git   (SSH)\n"
+                  "        https://github.com/owner/repo.git   (HTTPS)")
 
 def parse_owner_repo(url):
     """Extract 'owner/name' from an SSH or HTTPS GitHub URL, else ('', '')."""
@@ -554,10 +644,16 @@ def flow_init():
             info("You're on 'main'. When ready: `gitpilot branch` to create a "
                  "feature branch, or `gitpilot checkin` to commit more.")
 
+def _set_origin(url):
+    """Add 'origin' or repoint it if it already exists."""
+    if "origin" in git_out("remote", default="").splitlines():
+        git("remote", "set-url", "origin", url, mutating=True)
+    else:
+        git("remote", "add", "origin", url, mutating=True)
+
 def _init_wire_remote():
-    """Attach an origin remote and push main. Offers gh repo create when
-    available, else manual URL. Returns True if a remote is now usable
-    (successfully pushed), False otherwise."""
+    """Attach an origin remote and push main. Returns True if a remote is now
+    usable (successfully pushed), False otherwise."""
     if has_remote():
         info(f"Remote already configured: {default_remote()}.")
         return remote_branch_exists(DEFAULT_BRANCH)
@@ -566,21 +662,34 @@ def _init_wire_remote():
         info("No remote yet. Later: git remote add origin <url> && "
              f"git push -u origin {DEFAULT_BRANCH}")
         return False
+    return _setup_remote_interactive()
 
-    # Path A: gh can create the repo AND set the remote in one go.
-    if gh_available():
-        if not gh_authed():
-            info("GitHub CLI is installed but not authenticated.")
-            gh_try_login()
-        if gh_authed():
-            if confirm("Create the repo on GitHub with `gh` (sets origin + "
-                       "pushes)?", default_no=False):
-                return _gh_create_and_push()
-            # user declined gh despite being authed -> manual
-        # not authed (declined/failed login) -> fall through to manual
-
-    # Path B: manual URL (create the empty repo in the web UI first).
-    return _init_manual_remote()
+def _setup_remote_interactive():
+    """Shared remote setup used by `init` and the standalone `remote` command.
+    Leads with the URL/SSH path (which uses your EXISTING git auth); `gh` is
+    offered only as an optional convenience to auto-create the repo.
+    Returns True if main was pushed successfully."""
+    info("How auth works here: pushing uses your normal git credentials "
+         "(SSH key or HTTPS token) — the same ones that already work from the "
+         "shell. The GitHub CLI (`gh`) is OPTIONAL and only used to auto-CREATE "
+         "the repository.")
+    method = choose("How do you want to set up the remote?", [
+        ("url", "I have the repo URL (or will create it in the browser) — paste "
+                "it and push   [uses your existing SSH/HTTPS auth]"),
+        ("gh",  "Let `gh` create the GitHub repo for me   [needs a one-time gh "
+                "login]"),
+        ("skip", "Skip for now"),
+    ])
+    if method in (None, "skip"):
+        info("Skipped. Later: git remote add origin <url> && "
+             f"git push -u origin {DEFAULT_BRANCH}")
+        return False
+    if method == "gh":
+        if gh_available() and (gh_authed() or gh_try_login()):
+            return _gh_create_and_push()
+        warn("Couldn't use `gh` (not installed or not logged in). Falling back "
+             "to the URL method, which only needs your existing git auth.")
+    return _remote_via_url()
 
 def _gh_create_and_push():
     """Create the repo via gh from the current folder. Returns True on push."""
@@ -598,33 +707,144 @@ def _gh_create_and_push():
             info(r.stdout.strip())
         return True
     err("gh repo create failed:\n" + (r.stderr or "").strip())
-    info("You can still add a remote manually.")
-    return _init_manual_remote()
+    _diagnose_gh_error(r.stderr)
+    info("You can still add a remote manually (your SSH key already works).")
+    return _remote_via_url()
 
-def _init_manual_remote():
-    """Add an origin URL and push. Returns True if push succeeded."""
-    info("Create an EMPTY repo in your GitHub/GitLab web UI first (no README, "
-         "so histories don't clash), then paste its URL.")
+def _remote_via_url():
+    """Add an origin URL, verify reachability, then push. Uses existing git
+    auth (SSH/HTTPS). Returns True if push succeeded."""
+    print("  If the repo doesn't exist yet, create an EMPTY one in the web UI")
+    print("  (no README/license, so histories don't clash), then paste its URL.")
     url = ask("Remote URL (git@github.com:you/repo.git or https://…), Enter to "
               "skip")
     if not url:
         info("Skipped. Later: git remote add origin <url> && "
              f"git push -u origin {DEFAULT_BRANCH}")
         return False
-    # If origin already exists (e.g. a prior attempt), update it instead of failing.
-    if git_out("remote", default=""):
-        if "origin" in git_out("remote").splitlines():
-            git("remote", "set-url", "origin", url, mutating=True)
-        else:
-            git("remote", "add", "origin", url, mutating=True)
-    else:
-        git("remote", "add", "origin", url, mutating=True)
+    fixed, note = normalize_remote_url(url)
+    if fixed is None:
+        err(f"That URL won't work: {note}")
+        return False
+    if note:
+        warn(note)
+        if not confirm(f"Use '{fixed}'?", default_no=False):
+            info("Cancelled. Re-run remote setup with a corrected URL.")
+            return False
+    url = fixed
+    _set_origin(url)
     ok(f"origin \u2192 {url}")
+
+    # Verify we can actually read the remote BEFORE trying to push, so we can
+    # give a precise reason instead of a raw push error.
+    reachable, errtext = remote_reachable("origin")
+    if not reachable:
+        err("Can't read from that remote yet (checked with `git ls-remote`).")
+        cat = diagnose_push_failure(errtext, DEFAULT_BRANCH, url)
+        if cat == "not_found":
+            owner, name = parse_owner_repo(url)
+            target = f"{owner}/{name}" if owner and name else ""
+            # Offer gh create only if it's genuinely available+authed.
+            if target and gh_available() and (gh_authed() or gh_try_login()):
+                if confirm(f"Create '{target}' on GitHub now with gh and push?",
+                           default_no=False):
+                    vis = choose("Visibility?",
+                                 [("--private", "Private (recommended)"),
+                                  ("--public", "Public")]) or "--private"
+                    cr = run(["gh", "repo", "create", target, vis],
+                             check=False, mutating=True)
+                    if DRY_RUN or cr.returncode == 0:
+                        return _push_set_upstream("origin", DEFAULT_BRANCH)
+                    err("gh repo create failed:\n" + (cr.stderr or "").strip())
+                    return False
+            # No gh path — let them create it in the browser and retry.
+            if confirm("Create the empty repo in your browser now, then retry?",
+                       default_no=False):
+                ask("Press Enter once the empty repo exists on the web")
+                reachable, errtext = remote_reachable("origin")
+                if not reachable:
+                    err("Still can't read the remote.")
+                    diagnose_push_failure(errtext, DEFAULT_BRANCH, url)
+                    info(f"When it's ready: git push -u origin {DEFAULT_BRANCH}")
+                    return False
+            else:
+                info(f"When it's ready: git push -u origin {DEFAULT_BRANCH}")
+                return False
+        else:
+            info(f"Once resolved: git push -u origin {DEFAULT_BRANCH}")
+            return False
+
+    # Reachable — safe to push.
     if confirm(f"Push '{DEFAULT_BRANCH}' and set upstream now?",
                default_no=False):
         return _push_set_upstream("origin", DEFAULT_BRANCH)
     info(f"Later: git push -u origin {DEFAULT_BRANCH}")
     return False
+
+def flow_remote():
+    """Standalone remote manager: set up, verify, re-point, or push."""
+    head("Remote")
+    if not has_remote():
+        info("No remote configured yet.")
+        _setup_remote_interactive()
+        return
+    r = default_remote()
+    url = git_out("remote", "get-url", r, default="")
+    info(f"Current remote: {r} \u2192 {url}")
+    reachable, errtext = remote_reachable(r)
+    if reachable:
+        ok("Reachable — the repo exists and your git auth works.")
+    else:
+        err("Not reachable with your current git auth.")
+        diagnose_push_failure(errtext, current_branch(), url)
+    act = choose("What do you want to do?", [
+        ("verify",  "Re-check connectivity"),
+        ("repoint", "Change the remote URL"),
+        ("push",    f"Push '{current_branch()}' (set upstream)"),
+        ("create",  "Create the GitHub repo with gh (if it doesn't exist)"),
+        ("back",    "Back"),
+    ])
+    if act in (None, "back"):
+        return
+    if act == "verify":
+        okr, e = remote_reachable(r)
+        ok("Reachable.") if okr else diagnose_push_failure(e, current_branch(), url)
+    elif act == "repoint":
+        new = ask("New remote URL")
+        if new:
+            fixed, note = normalize_remote_url(new)
+            if fixed is None:
+                err(f"That URL won't work: {note}"); return
+            if note:
+                warn(note)
+                if not confirm(f"Use '{fixed}'?", default_no=False):
+                    return
+            new = fixed
+            _set_origin(new); ok(f"origin \u2192 {new}")
+            okr, e = remote_reachable("origin")
+            ok("Reachable.") if okr else diagnose_push_failure(e, current_branch(), new)
+    elif act == "push":
+        _push_set_upstream(r, current_branch())
+    elif act == "create":
+        if gh_available() and (gh_authed() or gh_try_login()):
+            owner, name = parse_owner_repo(url)
+            target = f"{owner}/{name}" if owner and name else \
+                ask("Repository (owner/name)")
+            if target:
+                vis = choose("Visibility?",
+                             [("--private", "Private (recommended)"),
+                              ("--public", "Public")]) or "--private"
+                cr = run(["gh", "repo", "create", target, vis],
+                         check=False, mutating=True)
+                if DRY_RUN or cr.returncode == 0:
+                    ok(f"Created '{target}'.")
+                    if confirm(f"Push '{current_branch()}' now?", default_no=False):
+                        _push_set_upstream(r, current_branch())
+                else:
+                    err("gh repo create failed:\n" + (cr.stderr or "").strip())
+        else:
+            info("gh unavailable — create the empty repo in the browser, then "
+                 "use 'Push' here.")
 
 # --------------------------------- doctor -----------------------------------
 
@@ -693,12 +913,21 @@ def doctor(verbose=True):
         warn("No .gitignore found — you risk committing build artifacts, "
              "venvs, and secrets.")
 
+    # Connectivity uses your git auth (SSH/HTTPS); gh is a separate, optional
+    # tool only for creating repos/releases. Report them independently.
+    if has_remote():
+        reachable, _ = remote_reachable(default_remote())
+        if reachable:
+            ok("Remote reachable with your git auth (SSH/HTTPS).")
+        else:
+            warn("Remote configured but NOT reachable — the repo may not exist "
+                 "yet, or your SSH key/token isn't set up for it.")
     if gh_available():
-        ok("GitHub CLI (gh) found — release automation available." +
-           ("" if gh_authed() else "  (not logged in: `gh auth login`)"))
+        ok("GitHub CLI (gh) found — optional; used for repo/release creation." +
+           ("" if gh_authed() else "  (not logged in — not required for push)"))
     else:
-        info("GitHub CLI (gh) not found — releases will fall back to "
-             "annotated tags + instructions.")
+        info("GitHub CLI (gh) not found — optional. Push/pull still work over "
+             "SSH/HTTPS; releases fall back to annotated tags + instructions.")
 
     d = dirty_files()
     if d:
@@ -1799,6 +2028,7 @@ def menu():
             ("doctor",  "\U0001fa7a Health check (preflight doctor)"),
             ("checkin", "\u2705 Check in code  (scan \u2192 stage \u2192 commit \u2192 sync \u2192 push)"),
             ("branch",  "\U0001f333 Branches (create / switch / merge / delete)"),
+            ("remote",  "\U0001f517 Remote (set up / verify / re-point / push)"),
             ("tag",     "\U0001f3f7\ufe0f  Tag a version (semver-guided, annotated)"),
             ("release", "\U0001f680 Create a release (tag + GitHub release)"),
             ("backup",  "\U0001f9f0 Backup now (worktree snapshot + full repo bundle)"),
@@ -1811,20 +2041,20 @@ def menu():
         FLOWS[act]()
 
 FLOWS = {"init": flow_init, "doctor": doctor, "checkin": flow_checkin,
-         "branch": flow_branch, "tag": flow_tag, "release": flow_release,
-         "backup": flow_backup, "restore": flow_restore, "fix": flow_fix,
-         "history": flow_history}
+         "branch": flow_branch, "remote": flow_remote, "tag": flow_tag,
+         "release": flow_release, "backup": flow_backup, "restore": flow_restore,
+         "fix": flow_fix, "history": flow_history}
 
 # Short aliases so muscle-memory works from the CLI.
 ALIASES = {"ci": "checkin", "commit": "checkin", "br": "branch",
            "merge": "branch", "check": "doctor", "log": "history",
            "undo": "fix", "snapshot": "backup", "new": "init",
-           "initialize": "init"}
+           "initialize": "init", "origin": "remote"}
 
 # Commands that are valid even when the folder is NOT yet a git repo.
 NO_REPO_OK = {"init", "doctor"}
 
-VERSION = "1.4.0"
+VERSION = "1.6.0"
 
 USAGE = """gitpilot v{ver} — guided, guard-railed git pipeline
 
@@ -1840,6 +2070,7 @@ Commands:
   doctor     preflight health check
   checkin    scan -> stage -> commit -> sync -> push   (aliases: ci, commit)
   branch     create / switch / merge / delete branches (aliases: br, merge)
+  remote     set up / verify / re-point / push a remote  (alias: origin)
   tag        semver-guided annotated tag
   release    tag + GitHub release (needs gh)
   backup     worktree snapshot + full repo bundle       (alias: snapshot)
