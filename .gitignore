@@ -1,0 +1,25 @@
+# Secrets and local state — never commit these.
+token
+*.env
+.env
+
+# Database. Contains your message bodies in plaintext.
+*.db
+*.db-wal
+*.db-shm
+
+# Runtime
+run.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
