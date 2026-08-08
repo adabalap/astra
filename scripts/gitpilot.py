@@ -17,6 +17,7 @@ Works on Linux, macOS, Termux/Android, WSL.
 
 Usage:
     python3 gitpilot.py            # interactive menu
+    python3 gitpilot.py init       # turn this folder into a git repo (day zero)
     python3 gitpilot.py doctor     # health check only
     python3 gitpilot.py checkin    # guided check-in flow
     python3 gitpilot.py branch     # create / switch / merge / delete branches
@@ -41,6 +42,7 @@ from datetime import datetime, timezone
 PROTECTED_BRANCHES = {"main", "master", "release", "production", "prod"}
 LARGE_FILE_MB = 25
 BACKUP_DIR_NAME = ".gitpilot-backups"
+DEFAULT_BRANCH = "main"
 
 SECRET_PATTERNS = [
     (r"AKIA[0-9A-Z]{16}", "AWS access key ID"),
@@ -65,6 +67,61 @@ SKIP_SCAN_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip",
                  ".gz", ".tar", ".whl", ".so", ".dylib", ".dll", ".bin",
                  ".litertlm", ".gguf", ".onnx", ".tflite", ".woff", ".woff2",
                  ".ttf", ".ico", ".mp4", ".mp3", ".sqlite", ".db"}
+
+# Minimal, widely-useful .gitignore snippets offered at init time.
+GITIGNORE_TEMPLATES = {
+    "python": """# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.coverage
+""",
+    "node": """# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+build/
+.cache/
+""",
+    "android": """# Android / Gradle
+*.apk
+*.aab
+*.ap_
+*.dex
+.gradle/
+build/
+local.properties
+.idea/
+captures/
+*.keystore
+*.jks
+""",
+    "common": """# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.log
+.idea/
+.vscode/
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key
+""",
+}
 
 DRY_RUN = False
 
@@ -227,6 +284,230 @@ def ahead_behind(branch, base):
     except ValueError:
         return None, None
 
+def ensure_identity():
+    """Make sure user.name/user.email are set; prompt if missing. Returns bool."""
+    name = git_out("config", "user.name")
+    email = git_out("config", "user.email")
+    if name and email:
+        return True
+    warn("git user.name / user.email are not set — commits need an author.")
+    if not name:
+        n = ask("Your name (for commit authorship)")
+        if n:
+            git("config", "user.name", n, mutating=True)
+    if not email:
+        e = ask("Your email (for commit authorship)")
+        if e:
+            git("config", "user.email", e, mutating=True)
+    return bool(git_out("config", "user.name") and git_out("config", "user.email"))
+
+# ---------------------------------- init ------------------------------------
+
+def flow_init():
+    """Turn the current directory into a git repo, establish `main`, make the
+    first commit, optionally wire up a remote, and drop into the feature-branch
+    workflow. The 'day zero' onboarding for an existing folder.
+    """
+    head("Initialize a repository from this folder")
+    cwd = os.getcwd()
+    info(f"Target folder: {cwd}")
+
+    # 0) already a repo? Don't clobber.
+    if in_repo():
+        root = repo_root()
+        if os.path.abspath(root) == os.path.abspath(cwd):
+            warn("This folder is ALREADY a git repository.")
+        else:
+            warn(f"This folder is inside an existing repository at: {root}")
+        info("Nothing to initialize. Use `checkin` to commit, or `branch` to "
+             "start a feature branch.")
+        return
+
+    entries = [e for e in os.listdir(cwd) if e not in (".", "..")]
+    if not entries:
+        info("Folder is empty — that's fine, we'll create the repo scaffolding.")
+    else:
+        info(f"Found {len(entries)} item(s) to bring under version control.")
+
+    if not confirm(f"Create a new git repo here and set '{DEFAULT_BRANCH}' as "
+                   "the default branch?", default_no=False):
+        info("Cancelled — no repository created."); return
+
+    # 1) git init with main as the initial branch (portable across git versions)
+    res = run(["git", "init", "-b", DEFAULT_BRANCH], check=False, mutating=True)
+    if res.returncode != 0:
+        # older git without -b: init then rename the unborn branch
+        git("init", mutating=True)
+        run(["git", "symbolic-ref", "HEAD", f"refs/heads/{DEFAULT_BRANCH}"],
+            check=False, mutating=True)
+    if not DRY_RUN and not in_repo():
+        err("git init did not produce a repository. Aborting."); return
+    ok(f"Initialized empty repository (default branch: {DEFAULT_BRANCH}).")
+
+    # 2) committer identity
+    if not DRY_RUN and not ensure_identity():
+        warn("No author identity set; you can add it later via `doctor`. "
+             "Continuing, but the first commit may fail.")
+
+    # 3) .gitignore — strongly recommended before the first add
+    root = cwd if DRY_RUN else repo_root()
+    gi_path = os.path.join(root, ".gitignore")
+    if os.path.exists(gi_path):
+        info(".gitignore already present — leaving it as-is.")
+    else:
+        if confirm("Create a .gitignore now (recommended, keeps junk/secrets "
+                   "out)?", default_no=False):
+            picks = choose("Which starter set?", [
+                ("python",  "Python"),
+                ("node",    "Node / JavaScript"),
+                ("android", "Android / Gradle"),
+                ("common",  "Just OS/editor + secrets basics"),
+                ("__skip__", "Skip for now"),
+            ])
+            if picks and picks != "__skip__":
+                content = GITIGNORE_TEMPLATES.get(picks, "")
+                # always fold in the common OS/secret rules
+                if picks != "common":
+                    content = content + "\n" + GITIGNORE_TEMPLATES["common"]
+                if DRY_RUN:
+                    info(f"[dry-run] would write .gitignore ({picks} + common)")
+                else:
+                    with open(gi_path, "w") as f:
+                        f.write(content)
+                    ok("Wrote .gitignore.")
+
+    # 4) preflight the very first commit: secret + large-file scan
+    #    We scan what WOULD be tracked (respecting .gitignore) before staging.
+    if not DRY_RUN:
+        would_track = git_out("add", "-A", "--dry-run", default="")
+        candidate = []
+        for line in would_track.splitlines():
+            # lines look like: add 'path/to/file'
+            m = re.match(r"add '(.+)'$", line.strip())
+            if m:
+                candidate.append(m.group(1))
+        if candidate:
+            findings = scan_secrets(candidate)
+            if findings:
+                head("\u26a0 Possible secrets detected in the initial import")
+                for rel, ln, label in findings[:20]:
+                    err(f"{rel}:{ln} — {label}")
+                warn("Once these land in the first commit they are in history "
+                     "forever. Move them to .env / env vars and .gitignore them.")
+                if not confirm("Commit them into history anyway (NOT "
+                               "recommended)?"):
+                    info("Init paused. Nothing committed. Clean up secrets, then "
+                         "re-run `gitpilot init`.")
+                    return
+            big = scan_large(candidate)
+            if big:
+                for rel, mb in big:
+                    warn(f"Large file: {rel} ({mb:.1f} MB) — consider Git LFS or "
+                         ".gitignore before the first commit.")
+                if not confirm("Include large files in the first commit?"):
+                    info("Init paused. Adjust .gitignore / `git lfs track`, then "
+                         "re-run `gitpilot init`.")
+                    return
+
+    # 5) stage + first commit on main
+    git("add", "-A", mutating=True)
+    staged = git_out("diff", "--cached", "--name-only")
+    if not staged and not DRY_RUN:
+        info("Nothing to commit yet (empty folder or everything ignored).")
+        info("Add some files, then run `gitpilot checkin`.")
+    else:
+        n = len(staged.splitlines()) if staged else 0
+        msg = ask("First commit message", "chore: initial commit")
+        if not msg.strip():
+            msg = "chore: initial commit"
+        r = git("commit", "-m", msg, check=False, mutating=True)
+        if not DRY_RUN and r.returncode != 0:
+            err("First commit failed:\n" + (r.stderr or "").strip())
+            info("Fix the issue (often a missing identity) and re-run `init`.")
+            return
+        ok(f"Committed {n} file(s) on '{DEFAULT_BRANCH}': {msg}")
+
+    # 6) optional remote wiring
+    _init_wire_remote()
+
+    # 7) hand off into the workflow: start a feature branch?
+    if has_commits() or DRY_RUN:
+        print()
+        if confirm("Start your first feature branch now (keep 'main' clean)?",
+                   default_no=False):
+            branch_new()
+        else:
+            info("You're on 'main'. When ready: `gitpilot branch` to create a "
+                 "feature branch, or `gitpilot checkin` to commit more.")
+
+def _init_wire_remote():
+    """Attach an origin remote and push main. Offers gh repo create when
+    available, else manual URL. All optional."""
+    if has_remote():
+        info(f"Remote already configured: {default_remote()}.")
+        return
+    if not confirm("Connect this repo to a remote (GitHub/GitLab) now?",
+                   default_no=False):
+        info("No remote yet. Later: git remote add origin <url> && "
+             f"git push -u origin {DEFAULT_BRANCH}")
+        return
+
+    # Path A: gh can create the repo AND set the remote in one go.
+    use_gh = False
+    if shutil.which("gh"):
+        auth = run(["gh", "auth", "status"], check=False)
+        if auth.returncode == 0:
+            use_gh = confirm("GitHub CLI is authenticated — create the repo on "
+                             "GitHub with `gh` (sets origin + pushes)?",
+                             default_no=False)
+        else:
+            info("gh is installed but not authenticated (`gh auth login`).")
+
+    if use_gh:
+        default_name = os.path.basename(os.getcwd())
+        name = ask("Repository name", default_name)
+        vis = choose("Visibility?", [("--private", "Private (recommended)"),
+                                      ("--public", "Public")]) or "--private"
+        # --source=. --remote=origin --push wires everything up.
+        cmd = ["gh", "repo", "create", name, vis, "--source=.",
+               "--remote=origin", "--push"]
+        r = run(cmd, check=False, mutating=True)
+        if (DRY_RUN) or r.returncode == 0:
+            ok(f"Created GitHub repo '{name}', set origin, pushed "
+               f"'{DEFAULT_BRANCH}'.")
+            if not DRY_RUN and r.stdout.strip():
+                info(r.stdout.strip())
+        else:
+            err("gh repo create failed:\n" + (r.stderr or "").strip())
+            info("You can still add a remote manually below.")
+            _init_manual_remote()
+        return
+
+    # Path B: manual URL (create the empty repo in the web UI first).
+    _init_manual_remote()
+
+def _init_manual_remote():
+    info("Create an EMPTY repo in your GitHub/GitLab web UI first (no README, "
+         "so histories don't clash), then paste its URL.")
+    url = ask("Remote URL (git@github.com:you/repo.git or https://…), Enter to "
+              "skip")
+    if not url:
+        info("Skipped. Later: git remote add origin <url> && "
+             f"git push -u origin {DEFAULT_BRANCH}")
+        return
+    git("remote", "add", "origin", url, mutating=True)
+    ok(f"Added origin \u2192 {url}")
+    if confirm(f"Push '{DEFAULT_BRANCH}' and set upstream now?",
+               default_no=False):
+        r = git("push", "-u", "origin", DEFAULT_BRANCH, check=False,
+                mutating=True)
+        if DRY_RUN or r.returncode == 0:
+            ok("Pushed with upstream set.")
+        else:
+            err("Push failed:\n" + (r.stderr or "").strip())
+            info("Common cause: the remote already has commits. Reconcile with: "
+                 f"git pull --rebase origin {DEFAULT_BRANCH}  (then push).")
+
 # --------------------------------- doctor -----------------------------------
 
 def doctor(verbose=True):
@@ -239,8 +520,8 @@ def doctor(verbose=True):
     ok(f"git found: {git_out('--version')}")
 
     if not in_repo():
-        err("Not inside a git repository. Run this from a project folder "
-            "(or `git init` first).")
+        err("Not inside a git repository. Run `gitpilot init` to create one "
+            "from this folder.")
         return False
     ok(f"Repository root: {repo_root()}")
 
@@ -316,7 +597,7 @@ def doctor(verbose=True):
 def scan_secrets(paths):
     """Scan given file paths for secret-looking content. Returns findings."""
     findings = []
-    root = repo_root()
+    root = repo_root() or os.getcwd()
     for rel in paths:
         p = os.path.join(root, rel)
         if not os.path.isfile(p):
@@ -338,7 +619,7 @@ def scan_secrets(paths):
     return findings
 
 def scan_large(paths):
-    root = repo_root()
+    root = repo_root() or os.getcwd()
     big = []
     for rel in paths:
         p = os.path.join(root, rel)
@@ -1383,6 +1664,7 @@ def menu():
     while True:
         head("gitpilot — guided git pipeline")
         act = choose("What do you want to do?", [
+            ("init",    "\U0001f195 Initialize a repo from this folder (day zero)"),
             ("doctor",  "\U0001fa7a Health check (preflight doctor)"),
             ("checkin", "\u2705 Check in code  (scan \u2192 stage \u2192 commit \u2192 sync \u2192 push)"),
             ("branch",  "\U0001f333 Branches (create / switch / merge / delete)"),
@@ -1397,16 +1679,21 @@ def menu():
             print("  bye \U0001f44b"); return
         FLOWS[act]()
 
-FLOWS = {"doctor": doctor, "checkin": flow_checkin, "branch": flow_branch,
-         "tag": flow_tag, "release": flow_release, "backup": flow_backup,
-         "restore": flow_restore, "fix": flow_fix, "history": flow_history}
+FLOWS = {"init": flow_init, "doctor": doctor, "checkin": flow_checkin,
+         "branch": flow_branch, "tag": flow_tag, "release": flow_release,
+         "backup": flow_backup, "restore": flow_restore, "fix": flow_fix,
+         "history": flow_history}
 
 # Short aliases so muscle-memory works from the CLI.
 ALIASES = {"ci": "checkin", "commit": "checkin", "br": "branch",
            "merge": "branch", "check": "doctor", "log": "history",
-           "undo": "fix", "snapshot": "backup"}
+           "undo": "fix", "snapshot": "backup", "new": "init",
+           "initialize": "init"}
 
-VERSION = "1.2.0"
+# Commands that are valid even when the folder is NOT yet a git repo.
+NO_REPO_OK = {"init", "doctor"}
+
+VERSION = "1.3.0"
 
 USAGE = """gitpilot v{ver} — guided, guard-railed git pipeline
 
@@ -1418,6 +1705,7 @@ Usage:
   gitpilot --version       show version
 
 Commands:
+  init       turn this folder into a git repo, set 'main', first commit (alias: new)
   doctor     preflight health check
   checkin    scan -> stage -> commit -> sync -> push   (aliases: ci, commit)
   branch     create / switch / merge / delete branches (aliases: br, merge)
@@ -1465,14 +1753,20 @@ def _run_main():
             err(f"Unknown command '{args[0]}'.")
             info("Run `gitpilot --help` to see available commands.")
             sys.exit(2)
-        if cmd != "doctor" and not in_repo():
-            err("Not a git repository. cd into a project (or git init) first.")
+        if cmd not in NO_REPO_OK and not in_repo():
+            err("Not a git repository. Run `gitpilot init` to create one from "
+                "this folder, or cd into an existing repo.")
             sys.exit(1)
         FLOWS[cmd]()
     else:
         if not in_repo():
-            err("Not a git repository. cd into a project (or git init) first.")
-            sys.exit(1)
+            # Offer the natural next step instead of just erroring out.
+            warn("This folder is not a git repository yet.")
+            if confirm("Initialize one here now with gitpilot?", default_no=False):
+                flow_init()
+            else:
+                info("Nothing done. Run `gitpilot init` whenever you're ready.")
+            return
         menu()
 
 def main():
