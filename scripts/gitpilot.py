@@ -1362,8 +1362,35 @@ BRANCH_PREFIXES = [
     ("__none__", "(no prefix — type the full name myself)"),
 ]
 
+def ref_exists(ref):
+    """True if `ref` resolves to a commit locally."""
+    if not ref:
+        return False
+    return bool(git_out("rev-parse", "--verify", "-q", f"{ref}^{{commit}}",
+                        default=""))
+
+def remote_default_branch(remote):
+    """Return the remote's default branch ref (e.g. 'origin/main') if we can
+    resolve it locally, else ''. Tries origin/HEAD, and falls back to a remote
+    tracking branch matching a common default name."""
+    if not remote:
+        return ""
+    # origin/HEAD is only present after a clone or `git remote set-head`.
+    head = git_out("symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD",
+                   default="")
+    if head and ref_exists(head):
+        return head
+    for b in ("main", "master", "develop"):
+        cand = f"{remote}/{b}"
+        if ref_exists(cand):
+            return cand
+    return ""
+
 def _pick_base_ref():
-    """Let the user choose the base to branch/merge from. Returns ref or None."""
+    """Let the user choose the base to branch/merge from. Returns ref or None.
+
+    Only offers refs that ACTUALLY resolve, so we never present a dead option
+    like 'origin/HEAD' on an init'd (non-cloned) repo where it was never set."""
     remote = default_remote()
     locals_ = all_branches()
     opts = []
@@ -1374,22 +1401,30 @@ def _pick_base_ref():
     for b in locals_:
         if b not in ("main", "master", "develop"):
             opts.append((b, f"{b}  (local)"))
-    if remote:
-        opts.append((f"{remote}/HEAD", f"{remote}/HEAD  (remote default branch)"))
+    # Only surface the remote default if it genuinely resolves locally.
+    rdef = remote_default_branch(remote)
+    if rdef:
+        opts.append((rdef, f"{rdef}  (remote default branch)"))
     opts.append(("__other__", "Other ref (tag / commit / remote branch)"))
-    base = choose("Base this off which ref?", opts)
-    if base == "__other__":
-        base = ask("Ref (e.g. origin/main, a tag, or a commit)")
-    return base or None
+    while True:
+        base = choose("Base this off which ref?", opts)
+        if base is None:
+            return None
+        if base == "__other__":
+            base = ask("Ref (e.g. origin/main, a tag, or a commit)")
+            if not base:
+                return None
+        # Validate here so a bad pick re-prompts instead of aborting the flow.
+        if ref_exists(base):
+            return base
+        err(f"'{base}' is not a valid ref. Pick another.")
 
 def branch_new(offer_publish=True):
     head("Create a new branch")
-    # 1) choose base
+    # 1) choose base (already validated to resolve inside _pick_base_ref)
     base = _pick_base_ref()
     if not base:
         return
-    if not git_out("rev-parse", "--verify", "-q", f"{base}^{{commit}}"):
-        err(f"'{base}' is not a valid ref."); return
 
     # 2) offer to refresh the base from the remote first (best practice).
     #    Only meaningful if the remote actually has this branch.
@@ -2054,7 +2089,7 @@ ALIASES = {"ci": "checkin", "commit": "checkin", "br": "branch",
 # Commands that are valid even when the folder is NOT yet a git repo.
 NO_REPO_OK = {"init", "doctor"}
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 USAGE = """gitpilot v{ver} — guided, guard-railed git pipeline
 
