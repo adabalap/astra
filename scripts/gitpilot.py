@@ -469,74 +469,241 @@ class KeyReader:
         ready,_,_=select.select([sys.stdin],[],[],timeout); return sys.stdin.read(1) if ready else None
 
 class GitPilotDashboard:
-    ACTIONS={"d":"doctor","c":"checkin","t":"tag","r":"release","b":"backup","o":"restore","f":"fix","h":"history"}
-    def __init__(self): self.console=Console(); self.view="status"; self.notice=""; self.state=collect_dashboard_state()
+    """Responsive dashboard plus an embedded pseudo-terminal workflow pane."""
+
+    ACTIONS={"d":"doctor","c":"checkin","t":"tag","r":"release",
+             "b":"backup","o":"restore","f":"fix","h":"history"}
+
+    def __init__(self):
+        self.console=Console()
+        self.view="status"
+        self.notice=""
+        self.state=collect_dashboard_state()
+        self.child_pid=None
+        self.child_fd=None
+        self.child_done=False
+        self.child_exit=None
+        self.workflow_name=""
+        self.output=""
+        self.scroll_offset=0
+
     def header(self):
-        title="GitPilot" if self.console.size.width<50 else "GitPilot | Guided Git Pipeline"; extra=[]
+        title="🚀 GitPilot" if self.console.size.width<55 else "🚀 GitPilot | Guided Git Pipeline"
+        extra=[]
         if DRY_RUN: extra.append("DRY RUN")
         if self.state["states"]: extra.append(" / ".join(self.state["states"]).upper())
-        return Panel(Align.center(Text(title+("  ["+", ".join(extra)+"]" if extra else ""),style="bold cyan")),height=3,border_style="bright_blue")
+        suffix=("  ["+", ".join(extra)+"]") if extra else ""
+        return Panel(Align.center(Text(title+suffix,style="bold cyan")),height=3,border_style="bright_blue")
+
     def nav(self):
         t=Text(justify="center")
-        for key,label in [("status","[S]tatus"),("changes","[G]Changes"),("actions","[A]ctions")]:
-            t.append(f" {label} ",style="bold black on cyan" if self.view==key else "dim white"); t.append(" ")
+        items=[("status","[S]tatus"),("changes","[D]iff"),("actions","[A]ctions")]
+        for key,label in items:
+            active=self.view==key
+            t.append(f" {label} ",style="bold black on bright_green" if active else "dim white")
+            t.append(" ")
         return Panel(t,height=3,border_style="dim")
+
     def status(self):
-        s=self.state; g=Table.grid(padding=(0,1),expand=True); g.add_column(style="bold cyan",no_wrap=True); g.add_column(overflow="fold")
-        g.add_row("Repository",s["repo_name"]); g.add_row("Path",s["root"]); g.add_row("Branch",s["branch"])
-        sync=(s["upstream"]+f"  [green]up {s['ahead']}[/green] [yellow]down {s['behind']}[/yellow]") if s["upstream"] else "[yellow]not configured[/yellow]"
-        g.add_row("Upstream",sync); g.add_row("Remote",f"{s['remote']}  {s['remote_url']}" if s["remote"] else "[yellow]none[/yellow]"); g.add_row("Last commit",s["last_commit"] or "[dim]none[/dim]")
-        return Panel(g,title="[bold green]Repository status[/bold green]",border_style="green")
+        s=self.state
+        body=Text()
+        body.append(f"Branch: {s['branch']}\n\n",style="bold yellow")
+        groups=[("Staged",s["staged"],"green"),("Modified",s["modified"],"red"),
+                ("Untracked",s["untracked"],"cyan"),("Conflicted",s["conflicted"],"bold red")]
+        available=max(8,self.console.size.height-15)
+        limit=max(2,available//max(1,sum(bool(files) for _,files,_ in groups)))
+        for title,files,style in groups:
+            if not files: continue
+            body.append(f"{title} ({len(files)}):\n",style=style)
+            for path in files[:limit]: body.append("  • ",style=style); body.append(path+"\n",style=style)
+            if len(files)>limit: body.append(f"  … {len(files)-limit} more\n",style="dim")
+            body.append("\n")
+        if not any(files for _,files,_ in groups): body.append("✓ Working tree is clean.\n",style="bold green")
+        sync=s["upstream"] or "no upstream"
+        if s["upstream"]: sync+=f"  ↑{s['ahead']} ↓{s['behind']}"
+        body.append(f"Upstream: {sync}\n",style="dim")
+        if s["last_commit"]: body.append(f"Last commit: {s['last_commit']}",style="dim")
+        return Panel(body,title="[bold green]Status[/bold green]",border_style="green",expand=True)
+
     def changes(self):
-        parts=[]; limit=max(2,min(10,(self.console.size.height-12)//4))
-        for title,key,color in [("Conflicted","conflicted","red"),("Staged","staged","green"),("Modified","modified","yellow"),("Untracked","untracked","cyan")]:
-            x=Text(); files=self.state[key]; x.append(f"{title} ({len(files)})\n",style=f"bold {color}")
-            for p in files[:limit]: x.append("  * ",style=color); x.append(p+"\n")
-            if not files: x.append("  none\n",style="dim")
-            if len(files)>limit: x.append(f"  ... {len(files)-limit} more\n",style="dim")
-            parts.append(x)
-        return Panel(Group(*parts),title="[bold yellow]Working tree[/bold yellow]",border_style="yellow")
+        body=Text()
+        diff=git_out("diff","--color=always","--stat")
+        staged=git_out("diff","--cached","--color=always","--stat")
+        if staged:
+            body.append("STAGED\n",style="bold green")
+            body.append_text(Text.from_ansi(staged)); body.append("\n\n")
+        if diff:
+            body.append("WORKING TREE\n",style="bold yellow")
+            body.append_text(Text.from_ansi(diff)); body.append("\n")
+        if not staged and not diff:
+            body.append("No tracked-file differences.\n",style="green")
+            if self.state["untracked"]:
+                body.append("\nUntracked files:\n",style="bold cyan")
+                for path in self.state["untracked"]: body.append(f"  • {path}\n",style="cyan")
+        return Panel(body,title="[bold yellow]Diff summary[/bold yellow]",border_style="yellow",expand=True)
+
     def actions(self):
-        rows=[("D","Doctor","Preflight"),("C","Check in","Scan, stage, commit, sync, push"),("T","Tag","Annotated version tag"),("R","Release","GitHub release"),("B","Backup","Snapshot and bundle"),("O","Restore","Safe restore"),("F","Fix","Amend, undo, recover"),("H","History","Commits, tags, stashes")]
-        t=Table(expand=True,box=None,show_header=False); t.add_column(width=4,style="bold cyan"); t.add_column(style="bold"); t.add_column(style="dim")
-        for a,b,c in rows: t.add_row(f"[{a}]",b,c if self.console.size.width>=60 else "")
-        return Panel(t,title="[bold magenta]Workflows[/bold magenta]",border_style="magenta")
+        rows=[("🩺","D","Doctor","Preflight health check"),
+              ("✅","C","Check in","Scan → stage → commit → sync → push"),
+              ("🏷️","T","Tag","Semver-guided annotated tag"),
+              ("🚀","R","Release","Tag plus GitHub release"),
+              ("🧰","B","Backup","Worktree snapshot plus repository bundle"),
+              ("⏪","O","Restore","Safe tag or version restore"),
+              ("🔧","F","Fix & Undo","Amend, undo, rename or recover"),
+              ("📜","H","History","Commits, tags and stashes")]
+        table=Table(expand=True,box=None,show_header=False,padding=(0,1))
+        table.add_column(width=3); table.add_column(width=5,style="bold cyan")
+        table.add_column(style="bold white"); table.add_column(style="dim")
+        narrow=self.console.size.width<65
+        for icon,key,name,desc in rows: table.add_row(icon,f"[{key}]",name,"" if narrow else desc)
+        return Panel(table,title="[bold magenta]Workflows[/bold magenta]",border_style="magenta",expand=True)
+
+    def visible_output(self):
+        """Render the child pseudo-terminal output inside the main panel."""
+        clean=self.output.replace("\x1b[?2004h","").replace("\x1b[?2004l","")
+        lines=clean.splitlines()
+        height=max(4,self.console.size.height-12)
+        max_offset=max(0,len(lines)-height)
+        self.scroll_offset=max(0,min(self.scroll_offset,max_offset))
+        end=len(lines)-self.scroll_offset
+        start=max(0,end-height)
+        visible="\n".join(lines[start:end])
+        text=Text.from_ansi(visible) if visible else Text("Starting workflow…",style="dim")
+        title=f"[bold cyan]{self.workflow_name}[/bold cyan]"
+        if self.child_done:
+            title+=f"  [dim](exit {self.child_exit})[/dim]"
+        return Panel(text,title=title,border_style="cyan",expand=True)
+
+    def footer_text(self):
+        if self.view=="workflow":
+            if self.child_done:
+                return "[Space/PgDn] Scroll down  [PgUp] Scroll up  [Home/End] Jump  [Enter/Esc] Back"
+            return "Type responses normally  [Ctrl+U/Ctrl+D] Scroll  [Ctrl+C] Interrupt"
+        return "[S] Status  [D] Diff  [A] Actions  [U] Refresh  [Q] Quit"
+
     def layout(self):
-        l=Layout(); l.split_column(Layout(name="head",size=3),Layout(name="nav",size=3),Layout(name="main",ratio=1),Layout(name="foot",size=3)); l["head"].update(self.header()); l["nav"].update(self.nav()); l["main"].update(self.status() if self.view=="status" else self.changes() if self.view=="changes" else self.actions()); footer=self.notice or "[S] Status  [G] Changes  [A] Actions  [U] Refresh  [Q] Quit"; l["foot"].update(Panel(Align.center(Text.from_markup(footer)),height=3,border_style="dim")); return l
-    def select_flow(self):
+        layout=Layout()
+        if self.view=="workflow":
+            layout.split_column(Layout(name="head",size=3),Layout(name="main",ratio=1),Layout(name="foot",size=3))
+            layout["head"].update(self.header()); layout["main"].update(self.visible_output())
+        else:
+            layout.split_column(Layout(name="head",size=3),Layout(name="nav",size=3),Layout(name="main",ratio=1),Layout(name="foot",size=3))
+            layout["head"].update(self.header()); layout["nav"].update(self.nav())
+            main=self.status() if self.view=="status" else self.changes() if self.view=="changes" else self.actions()
+            layout["main"].update(main)
+        footer=self.notice or self.footer_text()
+        layout["foot"].update(Panel(Align.center(Text.from_markup(footer)),height=3,border_style="dim"))
+        return layout
+
+    def start_workflow(self,action):
+        """Run an existing flow in a child PTY while keeping the Rich frame."""
+        if os.name=="nt":
+            self.notice="Embedded workflow view requires Linux, macOS, WSL or Termux."
+            return False
+        import pty
+        pid,fd=pty.fork()
+        if pid==0:
+            args=[sys.executable,os.path.abspath(__file__)]
+            if DRY_RUN: args.append("--dry-run")
+            args.append(action)
+            os.execv(sys.executable,args)
+        self.child_pid,self.child_fd=pid,fd
+        os.set_blocking(fd,False)
+        self.child_done=False; self.child_exit=None; self.workflow_name=action.replace("_"," ").title()
+        self.output=""; self.scroll_offset=0; self.view="workflow"; self.notice=""
+        return True
+
+    def pump_child(self):
+        if self.child_fd is None or self.child_done: return
+        try:
+            while True:
+                block=os.read(self.child_fd,65536)
+                if not block: break
+                self.output+=block.decode("utf-8",errors="replace")
+                if self.scroll_offset==0: self.scroll_offset=0
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
+        try:
+            pid,status=os.waitpid(self.child_pid,os.WNOHANG)
+        except ChildProcessError:
+            pid,status=self.child_pid,0
+        if pid:
+            self.child_done=True
+            self.child_exit=os.waitstatus_to_exitcode(status) if hasattr(os,"waitstatus_to_exitcode") else status
+            try:
+                while True:
+                    block=os.read(self.child_fd,65536)
+                    if not block: break
+                    self.output+=block.decode("utf-8",errors="replace")
+            except (BlockingIOError,OSError): pass
+            try: os.close(self.child_fd)
+            except OSError: pass
+            self.child_fd=None
+
+    def send_child(self,key):
+        if self.child_fd is not None:
+            try: os.write(self.child_fd,key.encode("utf-8"))
+            except OSError: pass
+
+    def handle_workflow_key(self,key):
+        if not key: return
+        if self.child_done:
+            page=max(3,self.console.size.height-14)
+            if key in ("\r","\n","\x1b"):
+                self.state=collect_dashboard_state(); self.view="actions"; self.notice="Workflow complete"
+            elif key==" ": self.scroll_offset=max(0,self.scroll_offset-page)
+            elif key=="\x15": self.scroll_offset+=page
+            elif key=="\x04": self.scroll_offset=max(0,self.scroll_offset-page)
+            return
+        if key=="\x15": self.scroll_offset+=max(3,self.console.size.height-14)   # Ctrl+U
+        elif key=="\x04": self.scroll_offset=max(0,self.scroll_offset-max(3,self.console.size.height-14)) # Ctrl+D
+        else: self.send_child(key)
+
+    def run(self):
         self.state=collect_dashboard_state()
         with KeyReader() as reader:
-            with Live(self.layout(),console=self.console,screen=True,auto_refresh=False,redirect_stdout=False,redirect_stderr=False) as live:
+            with Live(self.layout(),console=self.console,screen=True,auto_refresh=False,
+                      redirect_stdout=False,redirect_stderr=False) as live:
                 while True:
-                    k=reader.read()
-                    if k:
-                        k=k.lower(); self.notice=""
-                        if k in ("q","\x03"): return "quit"
+                    if self.view=="workflow": self.pump_child()
+                    key=reader.read(.05)
+                    if self.view=="workflow":
+                        self.handle_workflow_key(key)
+                    elif key:
+                        k=key.lower(); self.notice=""
+                        if k in ("q","\x03"): return
                         if k=="s": self.view="status"
-                        elif k=="g": self.view="changes"
+                        elif k=="d": self.view="changes"
                         elif k in ("a","\r","\n"): self.view="actions"
                         elif k=="u": self.state=collect_dashboard_state(); self.notice="Repository refreshed"
-                        elif k in self.ACTIONS: return self.ACTIONS[k]
+                        elif k in self.ACTIONS: self.start_workflow(self.ACTIONS[k])
                         else: self.notice=f"Unknown key: {repr(k)}"
                     live.update(self.layout(),refresh=True)
 
 def menu():
     while True:
-        act=choose("GitPilot",[("doctor","Health check"),("checkin","Check in code"),("tag","Tag version"),("release","Create release"),("backup","Backup"),("restore","Restore"),("fix","Fix and Undo"),("history","History"),("quit","Exit")])
-        if act in (None,"quit"): print("  bye"); return
+        act=choose("GitPilot",[("doctor","🩺 Health check"),("checkin","✅ Check in code"),("tag","🏷️ Tag version"),("release","🚀 Create release"),("backup","🧰 Backup"),("restore","⏪ Restore"),("fix","🔧 Fix and Undo"),("history","📜 History"),("quit","Exit")])
+        if act in (None,"quit"): print("  bye 👋"); return
         try: FLOWS[act]()
         except UserCancelled: warn("Cancelled.")
+
 def rich_menu():
-    dashboard=GitPilotDashboard()
-    while True:
-        action=dashboard.select_flow()
-        if action=="quit": print("  bye"); return
-        try: FLOWS[action]()
-        except UserCancelled: warn("Cancelled.")
-        except subprocess.CalledProcessError as ex: err(f"Command failed with exit code {ex.returncode}: {ex.stderr.strip() if ex.stderr else ''}")
-        try: ask("Press Enter to return to GitPilot")
-        except UserCancelled: return
-def can_use_rich_ui(): return RICH_AVAILABLE and sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM","").lower()!="dumb" and not os.environ.get("GITPILOT_CLASSIC")
+    GitPilotDashboard().run()
+
+def rich_ui_diagnostics():
+    """Return reasons why the fullscreen dashboard cannot be used."""
+    reasons=[]
+    if not RICH_AVAILABLE: reasons.append("the Python package 'rich' is not installed")
+    if not sys.stdin.isatty(): reasons.append("standard input is not an interactive terminal")
+    if not sys.stdout.isatty(): reasons.append("standard output is not an interactive terminal")
+    if os.environ.get("TERM", "").lower() == "dumb": reasons.append("TERM is set to 'dumb'")
+    if os.environ.get("GITPILOT_CLASSIC"): reasons.append("GITPILOT_CLASSIC is set")
+    return reasons
+
+def can_use_rich_ui():
+    return not rich_ui_diagnostics()
 
 FLOWS={"doctor":doctor,"checkin":flow_checkin,"tag":flow_tag,"release":flow_release,"backup":flow_backup,"restore":flow_restore,"fix":flow_fix,"history":flow_history}
 def main():
@@ -556,9 +723,23 @@ def main():
         return 0
     if not in_repo(): err("Not a git repository. cd into a project or run git init first."); return 1
     if force_rich and not RICH_AVAILABLE: err("Rich UI requested but Rich is not installed. Run: python3 -m pip install rich"); return 1
-    if force_classic: menu()
-    elif force_rich or can_use_rich_ui(): rich_menu()
-    else: menu()
+    if force_classic:
+        menu()
+    elif can_use_rich_ui():
+        rich_menu()
+    else:
+        reasons=rich_ui_diagnostics()
+        err("The fullscreen GitPilot dashboard could not start.")
+        for reason in reasons: print(f"    - {reason}")
+        if not RICH_AVAILABLE:
+            print("\n  Install the dashboard dependency with:")
+            print("    python3 -m pip install --user rich")
+            print("\n  On Termux, this is usually:")
+            print("    python -m pip install rich")
+        print("\n  Then run:")
+        print("    python3 gitpilot.py --rich")
+        print("\n  Use --classic only when you intentionally want the numbered menu.")
+        return 1
     return 0
 if __name__=="__main__": raise SystemExit(main())
 
